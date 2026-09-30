@@ -197,6 +197,7 @@ subroutine build_SDQH0(nShell, hData, nat, at, nbf, nao, xyz, trans, selfEnergy,
    integer itt(0:3)
    parameter(itt  =(/0,1,4,10/))
    real(wp) :: saw(10)
+   logical  :: has_contrib
 
 
    ! integrals
@@ -215,14 +216,13 @@ subroutine build_SDQH0(nShell, hData, nat, at, nbf, nao, xyz, trans, selfEnergy,
    !$omp& rab2,jzp,ish,ishtyp,icao,naoi,iptyp, &
    !$omp& jsh,jshmax,jshtyp,jcao,naoj,jptyp,ss,dd,qq,shpoly, &
    !$omp& est,alpi,alpj,ab,iprim,jprim,ip,jp,il,jl,hii,hjj,km,zi,zj,zetaij,hav, &
-   !$omp& mli,mlj,tmp,tmp1,tmp2,iao,jao,ii,jj,k,ij,itr) &
+   !$omp& mli,mlj,tmp,tmp1,tmp2,iao,jao,ii,jj,k,ij,itr,has_contrib) &
    !$omp shared(sint,dpint,qpint,H0,H0_noovlp) &
-   !$omp collapse(2) schedule(dynamic,32)
-   do iat = 1, nat
-      do jat = 1, nat
-         if (jat >= iat) cycle
-         ra(1:3) = xyz(1:3,iat)
-         izp = at(iat)
+   !$omp schedule(guided)
+   do iat = 2, nat
+      ra(1:3) = xyz(1:3,iat)
+      izp = at(iat)
+      do jat = 1, iat - 1
          jzp = at(jat)
          do ish = 1, nShell(izp)
             ishtyp = hData%angShell(ish,izp)
@@ -253,17 +253,18 @@ subroutine build_SDQH0(nShell, hData, nat, at, nbf, nao, xyz, trans, selfEnergy,
                do itr = 1, size(trans, dim=2)
                   rb(1:3) = xyz(1:3,jat) + trans(:, itr)
                   rab2 = sum( (rb-ra)**2 )
+                  if (rab2 > 2000.0_wp) cycle
+
+                  call get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ra,rb,point, &
+                     &               intcut,nprim,primcount,alp,cont,ss,dd,qq,has_contrib)
+                  if (.not. has_contrib) cycle
 
                   ! distance dependent polynomial
                   shpoly=shellPoly(hData%shellPoly(il,izp),hData%shellPoly(jl,jzp),&
                      &             hData%atomicRad(izp),hData%atomicRad(jzp),ra,rb)
 
-                  ss = 0.0_wp
-                  dd = 0.0_wp
-                  qq = 0.0_wp
-                  call get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ra,rb,point, &
-                     &               intcut,nprim,primcount,alp,cont,ss,dd,qq)
                   !transform from CAO to SAO
+                  if (ishtyp >= 2 .or. jshtyp >= 2) then
                   call dtrf2(ss,ishtyp,jshtyp)
                   do k = 1,3
                      tmp(1:6,1:6) = dd(k,1:6,1:6)
@@ -275,6 +276,7 @@ subroutine build_SDQH0(nShell, hData, nat, at, nbf, nao, xyz, trans, selfEnergy,
                      call dtrf2(tmp,ishtyp,jshtyp)
                      qq(k,1:6,1:6) = tmp(1:6,1:6)
                   enddo
+                  end if
                   do ii = 1,llao2(ishtyp)
                      iao = ii+saoshell(ish,iat)
                      do jj = 1,llao2(jshtyp)
@@ -332,13 +334,11 @@ subroutine build_SDQH0(nShell, hData, nat, at, nbf, nao, xyz, trans, selfEnergy,
             jcao = caoshell(jsh,iat)
             naoj = llao(jshtyp)
             jptyp = itt(jshtyp)
-            ss = 0.0_wp
-            dd = 0.0_wp
-            qq = 0.0_wp
             call get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ra,ra,point, &
                &               intcut,nprim,primcount,alp,cont,ss,dd,qq)
             !transform from CAO to SAO
             !call dtrf2(ss,ishtyp,jshtyp)
+            if (ishtyp >= 2 .or. jshtyp >= 2) then
             do k = 1,3
                tmp(1:6, 1:6) = dd(k,1:6, 1:6)
                call dtrf2(tmp, ishtyp, jshtyp)
@@ -349,6 +349,7 @@ subroutine build_SDQH0(nShell, hData, nat, at, nbf, nao, xyz, trans, selfEnergy,
                call dtrf2(tmp, ishtyp, jshtyp)
                qq(k, 1:6, 1:6) = tmp(1:6, 1:6)
             enddo
+            end if
             do ii = 1, llao2(ishtyp)
                iao = ii + saoshell(ish,iat)
                do jj = 1, llao2(jshtyp)
@@ -428,6 +429,7 @@ subroutine build_dSDQH0(nShell, hData, selfEnergy, dSEdcn, intcut, nat, nao, nbf
    integer :: il, jl, itr
    real(wp) :: zi, zj, zetaij, km, hii, hjj, hav, shpoly, dshpoly(3)
    real(wp) :: Pij, Hij, HPij, g_xyz(3)
+   logical  :: has_contrib
    real(wp), parameter :: rthr = 1600.0_wp
 
    thr2 = intcut
@@ -440,15 +442,14 @@ subroutine build_dSDQH0(nShell, hData, selfEnergy, dSEdcn, intcut, nat, nao, nbf
    !$omp& icao,naoi,iptyp,jsh,jshmax,jshtyp,jcao,naoj,jptyp, &
    !$omp& sdq,sdqg,est,alpi,alpj,ab,iprim,jprim,ip,jp,ri,rj,rij,km,shpoly,dshpoly, &
    !$omp& mli,mlj,dum,dumdum,tmp,stmp,dtmp,qtmp,il,jl,zi,zj,zetaij,hii,hjj,hav, &
-   !$omp& iao,jao,ii,jj,k,pij,hij,hpij,g_xyz,itr) &
+   !$omp& iao,jao,ii,jj,k,pij,hij,hpij,g_xyz,itr,has_contrib) &
    !$omp reduction(+:g,sigma,dhdcn) &
-   !$omp collapse(2) schedule(dynamic,32)
-   do iat = 1,nat
-      do jat = 1,nat
-         if (jat >= iat) cycle
-         ri = xyz(:,iat)
+   !$omp schedule(guided)
+   do iat = 2,nat
+      ri = xyz(:,iat)
+      izp = at(iat)
+      do jat = 1,iat-1
          jzp = at(jat)
-         izp = at(iat)
 
          do ish = 1,nShell(izp)
             ishtyp = hData%angShell(ish,izp)
@@ -486,14 +487,16 @@ subroutine build_dSDQH0(nShell, hData, selfEnergy, dSEdcn, intcut, nat, nao, nbf
 
                   if (rij2 > rthr) cycle
 
+                  call get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
+                     &                   intcut,nprim,primcount,alp,cont,sdq,sdqg,has_contrib)
+                  if (.not. has_contrib) cycle
+
                   ! distance dependent polynomial
                   call dshellPoly(hData%shellPoly(il,izp),hData%shellPoly(jl,jzp),&
                      & hData%atomicRad(izp),hData%atomicRad(jzp),rij2,ri,rj,&
                      & shpoly,dshpoly)
 
-                  sdqg = 0;sdq = 0
-                  call get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
-                     &                   intcut,nprim,primcount,alp,cont,sdq,sdqg)
+                  if (ishtyp >= 2 .or. jshtyp >= 2) then
                   tmp(1:6,1:6) = sdq(1,1:6,1:6)
                   call dtrf2(tmp,ishtyp,jshtyp)
                   sdq(1,1:6,1:6) = tmp(1:6,1:6)
@@ -506,6 +509,7 @@ subroutine build_dSDQH0(nShell, hData, selfEnergy, dSEdcn, intcut, nat, nao, nbf
                         sdqg(ixyz,k,1:6,1:6) = tmp(1:6,1:6)
                      enddo
                   enddo
+                  end if
                   g_xyz(:) = 0.0_wp
                   do ii = 1,llao2(ishtyp)
                      iao = ii+saoshell(ish,iat)
@@ -631,6 +635,7 @@ subroutine build_dSDQH0_noreset(nShell, hData, selfEnergy, dSEdcn, intcut, &
    integer :: il, jl, itr
    real(wp) :: zi, zj, zetaij, km, hii, hjj, hav, shpoly, dshpoly(3), dCN
    real(wp) :: Pij, Hij, HPij, g_xyz(3)
+   logical  :: has_contrib
    real(wp), parameter :: rthr = 1600.0_wp
 
    ! local OpenMP variables
@@ -647,7 +652,7 @@ subroutine build_dSDQH0_noreset(nShell, hData, selfEnergy, dSEdcn, intcut, &
    !$omp& icao,naoi,iptyp,jsh,jshmax,jshtyp,jcao,naoj,jptyp,dCN, &
    !$omp& sdq,sdqg,est,alpi,alpj,ab,iprim,jprim,ip,jp,ri,rj,rij,km,shpoly,dshpoly, &
    !$omp& mli,mlj,dum,dumdum,tmp,dtmp,qtmp,il,jl,zi,zj,zetaij,hii,hjj,hav, &
-   !$omp& iao,jao,ii,jj,k,pij,hij,hpij,g_xyz,itr, g_omp, sigma_omp, dhdcn_omp)
+   !$omp& iao,jao,ii,jj,k,pij,hij,hpij,g_xyz,itr,has_contrib, g_omp, sigma_omp, dhdcn_omp)
 
 !$ allocate(g_omp(size(g, dim=1), size(g, dim=2)), source = 0.0_wp)
 !$ allocate(sigma_omp(size(sigma, dim=1), size(sigma, dim=2)), source = 0.0_wp)
@@ -657,14 +662,13 @@ subroutine build_dSDQH0_noreset(nShell, hData, selfEnergy, dSEdcn, intcut, &
    associate(g_omp => g, sigma_omp => sigma, dhdcn_omp => dhdcn)
 #endif
 
-   !$omp do collapse(2) schedule(dynamic,32)
-   do iat = 1,nat
-      do jat = 1,nat
-         if (jat >= iat) cycle
-         izp = at(iat)
+   !$omp do schedule(guided)
+   do iat = 2,nat
+      izp = at(iat)
+      ri = xyz(:,iat)
+      do jat = 1,iat-1
          jzp = at(jat)
 
-         ri = xyz(:,iat)
          rj = xyz(:,jat)
          rij = ri - rj
          rij2 =  sum( rij**2 )
@@ -683,6 +687,10 @@ subroutine build_dSDQH0_noreset(nShell, hData, selfEnergy, dSEdcn, intcut, &
                naoj = llao(jshtyp)
                jptyp = itt(jshtyp)
 
+               call get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
+                  &                   intcut,nprim,primcount,alp,cont,sdq,sdqg,has_contrib)
+               if (.not. has_contrib) cycle
+
                il = ishtyp+1
                jl = jshtyp+1
                ! diagonals are the same for all H0 elements
@@ -697,9 +705,7 @@ subroutine build_dSDQH0_noreset(nShell, hData, selfEnergy, dSEdcn, intcut, &
                ! averaged H0 element (without overlap contribution!)
                hav = 0.5_wp * (hii + hjj)
 
-               sdqg = 0;sdq = 0
-               call get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
-                  &                   intcut,nprim,primcount,alp,cont,sdq,sdqg)
+               if (ishtyp >= 2 .or. jshtyp >= 2) then
                do k = 1,19 ! 1 S, 2-4 D, 5-10 Q, 11-13 D, 14-19 Q
                   do ixyz = 1,3
                      ! transform from CAO to SAO
@@ -709,6 +715,7 @@ subroutine build_dSDQH0_noreset(nShell, hData, selfEnergy, dSEdcn, intcut, &
                      sdqg(ixyz,k,1:6,1:6) = tmp(1:6,1:6)
                   enddo
                enddo
+               end if
                g_xyz(:) = 0.0_wp
                dCN = 0.0_wp
                do ii = 1,llao2(ishtyp)
