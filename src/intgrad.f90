@@ -876,8 +876,29 @@ pure subroutine get_grad_overlap(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj,point,i
 end subroutine get_grad_overlap
 
 
+pure subroutine obara_saika_1d(li_max, lj_max, di, dj, gama, I_tab)
+   integer, intent(in)  :: li_max, lj_max
+   real(wp),intent(in)  :: di, dj, gama
+   real(wp),intent(out) :: I_tab(0:, 0:)
+   integer :: li, lj
+   I_tab(0, 0) = 1.0_wp
+   if (li_max >= 1) I_tab(1, 0) = di
+   do li = 1, li_max - 1
+      I_tab(li + 1, 0) = di * I_tab(li, 0) + real(li, wp) * gama * I_tab(li - 1, 0)
+   end do
+   do lj = 0, lj_max - 1
+      I_tab(0, lj + 1) = dj * I_tab(0, lj)
+      if (lj > 0) I_tab(0, lj + 1) = I_tab(0, lj + 1) + real(lj, wp) * gama * I_tab(0, lj - 1)
+      do li = 1, li_max
+         I_tab(li, lj + 1) = dj * I_tab(li, lj) + real(li, wp) * gama * I_tab(li - 1, lj)
+         if (lj > 0) I_tab(li, lj + 1) = I_tab(li, lj + 1) + real(lj, wp) * gama * I_tab(li, lj - 1)
+      end do
+   end do
+end subroutine obara_saika_1d
+
+
 pure subroutine get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj,point, &
-      &                           intcut,nprim,primcount,alp,cont,ss,dd,qq)
+      &                           intcut,nprim,primcount,alp,cont,ss,dd,qq,has_contrib)
    integer, intent(in)  :: icao
    integer, intent(in)  :: jcao
    integer, intent(in)  :: naoi
@@ -891,22 +912,29 @@ pure subroutine get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj,point, &
    real(wp),intent(out) :: ss(:,:)
    real(wp),intent(out) :: dd(:,:,:)
    real(wp),intent(out) :: qq(:,:,:)
+   logical, intent(out), optional :: has_contrib
 
    integer, intent(in)  :: nprim(:)
    integer, intent(in)  :: primcount(:)
    real(wp),intent(in)  :: alp(:)
    real(wp),intent(in)  :: cont(:)
 
-   integer  :: ip,iprim,mli,jp,jprim,mlj,k,iptyp,jptyp
-   real(wp) :: rij(3),rp(3),rij2,alpi,alpj,ci,cj,cc,kab,t(0:8)
+   integer  :: ip,iprim,mli,jp,jprim,mlj,k,iptyp,jptyp,li,lj
+   real(wp) :: rij(3),rp(3),rij2,alpi,alpj,ci,cj,cc,kab,d_jc
    real(wp) :: ab,est,saw(10),sawg(3,10)
+   real(wp) :: I_tab(0:4, 0:6), val_1d(3, 3, 0:4, 0:4), vx(3), vy(3), vz(3)
+   logical  :: contrib
 
    real(wp),parameter :: max_r2 = 2000.0_wp
    real(wp),parameter :: sqrtpi = sqrt(pi)
 
-   ss = 0.0_wp
-   dd = 0.0_wp
-   qq = 0.0_wp
+   contrib = .false.
+   if (present(has_contrib)) has_contrib = .false.
+   if (.not. present(has_contrib)) then
+      ss = 0.0_wp
+      dd = 0.0_wp
+      qq = 0.0_wp
+   end if
    iptyp = itt(ishtyp)
    jptyp = itt(jshtyp)
 
@@ -926,12 +954,26 @@ pure subroutine get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj,point, &
          alpj = alp(jprim)
          est = alpi*alpj*rij2
          if(est.gt.intcut*(alpi+alpj)) cycle
+         if (.not. contrib) then
+            contrib = .true.
+            ss(1:naoj, 1:naoi) = 0.0_wp
+            dd(:, 1:naoj, 1:naoi) = 0.0_wp
+            qq(:, 1:naoj, 1:naoi) = 0.0_wp
+         end if
          ab = 1.0_wp/(alpi+alpj)
          est = est*ab
          kab = exp(-est)*(sqrtpi*sqrt(ab))**3
          rp = (alpi*ri + alpj*rj)*ab
-         do k = 0, ishtyp + jshtyp + 2
-            t(k) = olapp(k, alpi+alpj)
+         do k = 1, 3
+            call obara_saika_1d(ishtyp, jshtyp + 2, rp(k) - ri(k), rp(k) - rj(k), 0.5_wp * ab, I_tab)
+            d_jc = rj(k) - point(k)
+            do lj = 0, jshtyp
+               do li = 0, ishtyp
+                  val_1d(1, k, li, lj) = I_tab(li, lj)
+                  val_1d(2, k, li, lj) = I_tab(li, lj + 1) + d_jc * I_tab(li, lj)
+                  val_1d(3, k, li, lj) = I_tab(li, lj + 2) + d_jc * (2.0_wp * I_tab(li, lj + 1) + d_jc * I_tab(li, lj))
+               end do
+            end do
          end do
          !--------------- compute gradient ----------
          ! now compute integrals  for different components of i(e.g., px,py,pz)
@@ -942,9 +984,13 @@ pure subroutine get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj,point, &
             do mlj = 1,naoj
                jprim = jp+primcount(jcao+mlj)
                cc = kab*cont(jprim)*ci
-               saw = 0;sawg = 0
-               call multipole_3d(ri,rj,point,rp,alpi,alpj, &
-                  & lxyz(:,iptyp+mli),lxyz(:,jptyp+mlj),t,saw)
+               vx = val_1d(:, 1, lxyz(1, iptyp+mli), lxyz(1, jptyp+mlj))
+               vy = val_1d(:, 2, lxyz(2, iptyp+mli), lxyz(2, jptyp+mlj))
+               vz = val_1d(:, 3, lxyz(3, iptyp+mli), lxyz(3, jptyp+mlj))
+               saw(1) = vx(1)*vy(1)*vz(1); saw(2) = vx(2)*vy(1)*vz(1); saw(3) = vx(1)*vy(2)*vz(1)
+               saw(4) = vx(1)*vy(1)*vz(2); saw(5) = vx(3)*vy(1)*vz(1); saw(6) = vx(1)*vy(3)*vz(1)
+               saw(7) = vx(1)*vy(1)*vz(3); saw(8) = vx(2)*vy(2)*vz(1); saw(9) = vx(2)*vy(1)*vz(2)
+               saw(10) = vx(1)*vy(2)*vz(2)
                ss(mlj,mli) = ss(mlj,mli) + saw(1)*cc
                dd(:,mlj,mli) = dd(:,mlj,mli) + saw(2:4)*cc
                qq(:,mlj,mli) = qq(:,mlj,mli) + saw(5:10)*cc
@@ -952,11 +998,12 @@ pure subroutine get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj,point, &
          enddo  ! mli : Cartesian component of i prims
       enddo ! jp : loop over j prims
    enddo  ! ip : loop over i prims
+   if (present(has_contrib)) has_contrib = contrib
 end subroutine get_multiints
 
 
 pure subroutine get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
-      &                           intcut,nprim,primcount,alp,cont,sdq,sdqg)
+      &                           intcut,nprim,primcount,alp,cont,sdq,sdqg,has_contrib)
    integer, intent(in)  :: icao
    integer, intent(in)  :: jcao
    integer, intent(in)  :: naoi
@@ -968,21 +1015,29 @@ pure subroutine get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
    real(wp),intent(in)  :: intcut
    real(wp),intent(out) :: sdq(:,:,:)
    real(wp),intent(out) :: sdqg(:,:,:,:)
+   logical, intent(out), optional :: has_contrib
 
    integer, intent(in)  :: nprim(:)
    integer, intent(in)  :: primcount(:)
    real(wp),intent(in)  :: alp(:)
    real(wp),intent(in)  :: cont(:)
 
-   integer  :: ip,iprim,mli,jp,jprim,mlj,k,iptyp,jptyp
-   real(wp) :: rij(3),rp(3),rij2,alpi,alpj,ci,cj,cc,kab,t(0:8)
+   integer  :: ip,iprim,mli,jp,jprim,mlj,k,iptyp,jptyp,li,lj
+   real(wp) :: rij(3),rp(3),rij2,alpi,alpj,ci,cj,cc,kab
    real(wp) :: ab,est,saw(10),sawg(3,10)
+   real(wp) :: I_tab(0:5, 0:6), val_1d(3, 3, 0:4, 0:4), gra_1d(3, 3, 0:4, 0:4)
+   real(wp) :: vx(3), vy(3), vz(3), gx(3), gy(3), gz(3)
+   logical  :: contrib
 
    real(wp),parameter :: max_r2 = 2000.0_wp
    real(wp),parameter :: sqrtpi = sqrt(pi)
 
-   sdqg = 0.0_wp
-   sdq  = 0.0_wp
+   contrib = .false.
+   if (present(has_contrib)) has_contrib = .false.
+   if (.not. present(has_contrib)) then
+      sdqg = 0.0_wp
+      sdq  = 0.0_wp
+   end if
    iptyp = itt(ishtyp)
    jptyp = itt(jshtyp)
 
@@ -1002,12 +1057,25 @@ pure subroutine get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
          alpj = alp(jprim)
          est = alpi*alpj*rij2
          if(est.gt.intcut*(alpi+alpj)) cycle
+         if (.not. contrib) then
+            contrib = .true.
+            sdq(:, 1:naoj, 1:naoi) = 0.0_wp
+            sdqg(:, :10, 1:naoj, 1:naoi) = 0.0_wp
+         end if
          ab = 1.0_wp/(alpi+alpj)
          est = est*ab
          kab = exp(-est)*(sqrtpi*sqrt(ab))**3
          rp = (alpi*ri + alpj*rj)*ab
-         do k = 0, ishtyp + jshtyp + 3
-            t(k) = olapp(k, alpi+alpj)
+         do k = 1, 3
+            call obara_saika_1d(ishtyp + 1, jshtyp + 2, rp(k) - ri(k), rp(k) - rj(k), 0.5_wp * ab, I_tab)
+            do lj = 0, jshtyp
+               do li = 0, ishtyp
+                  val_1d(1:3, k, li, lj) = I_tab(li, lj:lj+2)
+                  gra_1d(1:3, k, li, lj) = 2.0_wp * alpi * I_tab(li + 1, lj:lj+2)
+                  if (li > 0) gra_1d(1:3, k, li, lj) = gra_1d(1:3, k, li, lj) &
+                     & - real(li, wp) * I_tab(li - 1, lj:lj+2)
+               end do
+            end do
          end do
          !--------------- compute gradient ----------
          ! now compute integrals  for different components of i(e.g., px,py,pz)
@@ -1018,20 +1086,36 @@ pure subroutine get_grad_multiint(icao,jcao,naoi,naoj,ishtyp,jshtyp,ri,rj, &
             do mlj = 1,naoj
                jprim = jp+primcount(jcao+mlj)
                cc = kab*cont(jprim)*ci
-               saw = 0;sawg = 0
-               call multipole_grad_3d(ri,rj,rj,rp,alpi,alpj, &
-                  & lxyz(:,iptyp+mli),lxyz(:,jptyp+mlj),t,saw,sawg)
+               vx = val_1d(:, 1, lxyz(1, iptyp+mli), lxyz(1, jptyp+mlj))
+               vy = val_1d(:, 2, lxyz(2, iptyp+mli), lxyz(2, jptyp+mlj))
+               vz = val_1d(:, 3, lxyz(3, iptyp+mli), lxyz(3, jptyp+mlj))
+               gx = gra_1d(:, 1, lxyz(1, iptyp+mli), lxyz(1, jptyp+mlj))
+               gy = gra_1d(:, 2, lxyz(2, iptyp+mli), lxyz(2, jptyp+mlj))
+               gz = gra_1d(:, 3, lxyz(3, iptyp+mli), lxyz(3, jptyp+mlj))
+               saw(1) = vx(1)*vy(1)*vz(1); sawg(:, 1) = [gx(1)*vy(1)*vz(1), vx(1)*gy(1)*vz(1), vx(1)*vy(1)*gz(1)]
+               saw(2) = vx(2)*vy(1)*vz(1); sawg(:, 2) = [gx(2)*vy(1)*vz(1), vx(2)*gy(1)*vz(1), vx(2)*vy(1)*gz(1)]
+               saw(3) = vx(1)*vy(2)*vz(1); sawg(:, 3) = [gx(1)*vy(2)*vz(1), vx(1)*gy(2)*vz(1), vx(1)*vy(2)*gz(1)]
+               saw(4) = vx(1)*vy(1)*vz(2); sawg(:, 4) = [gx(1)*vy(1)*vz(2), vx(1)*gy(1)*vz(2), vx(1)*vy(1)*gz(2)]
+               saw(5) = vx(3)*vy(1)*vz(1); sawg(:, 5) = [gx(3)*vy(1)*vz(1), vx(3)*gy(1)*vz(1), vx(3)*vy(1)*gz(1)]
+               saw(6) = vx(1)*vy(3)*vz(1); sawg(:, 6) = [gx(1)*vy(3)*vz(1), vx(1)*gy(3)*vz(1), vx(1)*vy(3)*gz(1)]
+               saw(7) = vx(1)*vy(1)*vz(3); sawg(:, 7) = [gx(1)*vy(1)*vz(3), vx(1)*gy(1)*vz(3), vx(1)*vy(1)*gz(3)]
+               saw(8) = vx(2)*vy(2)*vz(1); sawg(:, 8) = [gx(2)*vy(2)*vz(1), vx(2)*gy(2)*vz(1), vx(2)*vy(2)*gz(1)]
+               saw(9) = vx(2)*vy(1)*vz(2); sawg(:, 9) = [gx(2)*vy(1)*vz(2), vx(2)*gy(1)*vz(2), vx(2)*vy(1)*gz(2)]
+               saw(10) = vx(1)*vy(2)*vz(2); sawg(:, 10) = [gx(1)*vy(2)*vz(2), vx(1)*gy(2)*vz(2), vx(1)*vy(2)*gz(2)]
                sdq(:,mlj,mli) = sdq(:,mlj,mli) + saw*cc
                sdqg(:,:10,mlj,mli) = sdqg(:,:10,mlj,mli) + sawg*cc
             enddo ! mlj : Cartesian component of j prims
          enddo  ! mli : Cartesian component of i prims
       enddo ! jp : loop over j prims
    enddo  ! ip : loop over i prims
+   if (contrib) then
    do mli = 1,naoi
       do mlj = 1,naoj
          call shiftintg(sdqg(:,:,mlj,mli),sdq(:,mlj,mli),rij)
       enddo
    enddo
+   end if
+   if (present(has_contrib)) has_contrib = contrib
 end subroutine get_grad_multiint
 
 
@@ -1083,6 +1167,7 @@ subroutine sdqint(nShell,angShell,nat,at,nbf,nao,xyz,intcut,caoshell,saoshell, &
    integer itt(0:3)
    parameter(itt  =(/0,1,4,10/))
    real(wp) :: saw(10)
+   logical  :: has_contrib
 
 
    ! integrals
@@ -1097,7 +1182,7 @@ subroutine sdqint(nShell,angShell,nat,at,nbf,nao,xyz,intcut,caoshell,saoshell, &
    !$omp& rab2,jzp,ish,ishtyp,icao,naoi,iptyp, &
    !$omp& jsh,jshmax,jshtyp,jcao,naoj,jptyp,ss,dd,qq, &
    !$omp& est,alpi,alpj,ab,iprim,jprim,ip,jp, &
-   !$omp& mli,mlj,tmp,tmp1,tmp2,iao,jao,ii,jj,k,ij) &
+   !$omp& mli,mlj,tmp,tmp1,tmp2,iao,jao,ii,jj,k,ij,has_contrib) &
    !$omp shared (sint,dpint,qpint)
    do iat = 1,nat
       ra(1:3) = xyz(1:3,iat)
@@ -1118,12 +1203,11 @@ subroutine sdqint(nShell,angShell,nat,at,nbf,nao,xyz,intcut,caoshell,saoshell, &
                jcao = caoshell(jsh,jat)
                naoj = llao(jshtyp)
                jptyp = itt(jshtyp)
-               ss = 0.0_wp
-               dd = 0.0_wp
-               qq = 0.0_wp
                call get_multiints(icao,jcao,naoi,naoj,ishtyp,jshtyp,ra,rb,point, &
-                  &               intcut,nprim,primcount,alp,cont,ss,dd,qq)
+                  &               intcut,nprim,primcount,alp,cont,ss,dd,qq,has_contrib)
+               if (.not. has_contrib) cycle
                !transform from CAO to SAO
+               if (ishtyp >= 2 .or. jshtyp >= 2) then
                call dtrf2(ss,ishtyp,jshtyp)
                do k = 1,3
                   tmp(1:6,1:6) = dd(k,1:6,1:6)
@@ -1135,6 +1219,7 @@ subroutine sdqint(nShell,angShell,nat,at,nbf,nao,xyz,intcut,caoshell,saoshell, &
                   call dtrf2(tmp,ishtyp,jshtyp)
                   qq(k,1:6,1:6) = tmp(1:6,1:6)
                enddo
+               end if
                do ii = 1,llao2(ishtyp)
                   iao = ii+saoshell(ish,iat)
                   do jj = 1,llao2(jshtyp)
@@ -1178,6 +1263,7 @@ subroutine sdqint(nShell,angShell,nat,at,nbf,nao,xyz,intcut,caoshell,saoshell, &
                &               intcut,nprim,primcount,alp,cont,ss,dd,qq)
             !transform from CAO to SAO
             !call dtrf2(ss,ishtyp,jshtyp)
+            if (ishtyp >= 2 .or. jshtyp >= 2) then
             do k = 1,3
                tmp(1:6, 1:6) = dd(k,1:6, 1:6)
                call dtrf2(tmp, ishtyp, jshtyp)
@@ -1188,6 +1274,7 @@ subroutine sdqint(nShell,angShell,nat,at,nbf,nao,xyz,intcut,caoshell,saoshell, &
                call dtrf2(tmp, ishtyp, jshtyp)
                qq(k, 1:6, 1:6) = tmp(1:6, 1:6)
             enddo
+            end if
             do ii = 1, llao2(ishtyp)
                iao = ii + saoshell(ish,iat)
                do jj = 1, llao2(jshtyp)

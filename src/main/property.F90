@@ -152,6 +152,7 @@ module xtb_propertyoutput
       real(wp) :: dip, dipol(3)
       real(wp) :: intcut, neglect
       real(wp), parameter :: trans(3, 1) = 0.0_wp
+      logical :: need_sdq
 
       type(TBorn) :: gbsa
 
@@ -163,6 +164,12 @@ module xtb_propertyoutput
       ndim = basis%nao * (basis%nao + 1) / 2
       allocate (S(basis%nao, basis%nao), dpint(3, basis%nao, basis%nao), &
          & qpint(6, basis%nao, basis%nao), source=0.0_wp)
+      need_sdq = (set%pr_mulliken .and. set%gfn_method == 1) &
+         & .or. (set%pr_spin_population .and. wfx%nopen /= 0) &
+         & .or. set%pr_fod_pop &
+         & .or. (set%pr_dipole .and. set%gfn_method <= 1) &
+         & .or. set%pr_lmo
+      if (need_sdq) then
 #ifdef XTB_GPU
       call sdqint_gpu(xtbData%nShell, xtbData%hamiltonian%angShell, mol%n, mol%at, &
          &        basis%nbf, basis%nao, mol%xyz, trans, intcut, &
@@ -174,6 +181,7 @@ module xtb_propertyoutput
          &        basis%caoshell, basis%saoshell, basis%nprim, basis%primcount, &
          &        basis%alp, basis%cont, S, dpint, qpint)
 #endif
+      end if
 
 !! orbital energies and occupation
       if (set%pr_eig) then

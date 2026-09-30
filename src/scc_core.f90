@@ -20,7 +20,7 @@ module xtb_scc_core
    use xtb_mctc_accuracy, only : wp
    use xtb_mctc_la, only : contract
    use xtb_mctc_lapack, only : lapack_sygvd
-   use xtb_mctc_blas, only : blas_gemm, mctc_symv, mctc_gemm
+   use xtb_mctc_blas, only : blas_gemm, blas_syrk, blas_trmm, mctc_symv, mctc_gemm
    use xtb_mctc_lapack_eigensolve, only : TEigenSolver
    use xtb_type_environment, only : TEnvironment
    use xtb_type_solvation, only : TSolvation
@@ -365,6 +365,10 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 !! ------------------------------------------------------------------------
 !  Factorized overlap to avoid multiple factorizations
    real(wp), allocatable :: S_factorized(:,:)
+   real(wp), allocatable :: Z_evec(:,:), tau_trd(:), e_sub(:), work_trd(:), work_edc(:)
+   integer,  allocatable :: iwork_edc(:)
+   integer  :: info_la, lwork_trd, lwork_edc, liwork_edc, m_occ
+   external :: dtrtri, dtrmm, dsytrd, dstedc, dormtr
 !! ------------------------------------------------------------------------
 !  results of the SCC iterator
    real(wp),intent(out)   :: eel
@@ -411,6 +415,20 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
    allocate(S_factorized(ndim, ndim), source = 0.0_wp )
    S_factorized = S
    call mctc_potrf(env, S_factorized)
+   call env%check(fail)
+   if (fail) return
+   call dtrtri('U', 'N', ndim, S_factorized, ndim, info_la)
+   if (info_la /= 0) then
+      call env%error("Diagonalization of Hamiltonian failed", source)
+      fail = .true.
+      return
+   end if
+   lwork_trd = max(1, 64*ndim)
+   lwork_edc = 1 + 4*ndim + ndim**2
+   liwork_edc = 3 + 5*ndim
+   allocate(Z_evec(ndim, ndim), tau_trd(ndim), e_sub(ndim), &
+      &     work_trd(lwork_trd), work_edc(lwork_edc), iwork_edc(liwork_edc))
+   m_occ = 0
 
    converged = .false.
    lastdiag = .false.
@@ -472,10 +490,24 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 
    !call solve(fulldiag,ndim,ihomo,scfconv,H,S,X,P,emo,fail)
 
-   call solver%fact_solve(env, H, S_factorized, emo)
-   call env%check(fail)
-   if(fail)then
+   do j = 1, ndim, 96
+      jj = min(ndim, j + 95)
+      k = jj - j + 1
+      Z_evec(1:jj, j:jj) = H(1:jj, j:jj)
+      call dtrmm('R', 'U', 'N', 'N', jj, k, 1.0_wp, S_factorized(j, j), ndim, Z_evec(1, j), ndim)
+      if (j > 1) then
+         call blas_gemm('N', 'N', jj, k, j - 1, 1.0_wp, H, ndim, S_factorized(:, j:), ndim, 1.0_wp, Z_evec(:, j:), ndim)
+      end if
+      call dtrmm('L', 'U', 'T', 'N', jj, k, 1.0_wp, S_factorized, ndim, Z_evec(1, j), ndim)
+   end do
+   H = Z_evec
+   call dsytrd('U', ndim, H, ndim, emo, e_sub, tau_trd, work_trd, lwork_trd, info_la)
+   if (info_la == 0) then
+      call dstedc('I', ndim, emo, e_sub, Z_evec, ndim, work_edc, lwork_edc, iwork_edc, liwork_edc, info_la)
+   end if
+   if (info_la /= 0) then
       call env%error("Diagonalization of Hamiltonian failed", source)
+      fail = .true.
       return
    endif
 
@@ -509,8 +541,21 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
       call gfn2broyden_save(n,k,nbr,dipm,qp,q_in)
    end if
 
+   ! Transform only occupied orbitals during SCC iterations
+   m_occ = 0
+   do i = ndim, 1, -1
+      if (abs(focc(i)) > 0.0_wp) then
+         m_occ = i
+         exit
+      end if
+   end do
+   if (m_occ > 0) then
+      call dormtr('L', 'U', 'N', ndim, m_occ, H, ndim, tau_trd, Z_evec, ndim, work_trd, lwork_trd, info_la)
+      call blas_trmm('L', 'U', 'N', 'N', ndim, m_occ, 1.0_wp, S_factorized, ndim, Z_evec, ndim)
+   end if
+
    ! density matrix
-   call dmat(ndim,focc,H,P)
+   call dmat(ndim,focc,Z_evec,P)
 
    ! new q
    call mpopsh(n,ndim,nshell,ao2sh,S,P,qsh)
@@ -633,6 +678,16 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
 !! ------------------------------------------------------------------------
 
    enddo scc_iterator
+
+   if (thisiter >= 1) then
+      if (m_occ < ndim) then
+         call dormtr('L', 'U', 'N', ndim, ndim - m_occ, H, ndim, tau_trd, &
+            & Z_evec(1, m_occ + 1), ndim, work_trd, lwork_trd, info_la)
+         call blas_trmm('L', 'U', 'N', 'N', ndim, ndim - m_occ, 1.0_wp, &
+            & S_factorized, ndim, Z_evec(:, m_occ + 1:), ndim)
+      end if
+      H = Z_evec
+   end if
 
    jter = jter + min(iter,thisiter)
    fail = .not.converged
@@ -1179,10 +1234,33 @@ subroutine dmat(ndim,focc,C,P)
    real(wp),intent(in)  :: focc(:)
    real(wp),intent(in)  :: C(:,:)
    real(wp),intent(out) :: P(:,:)
-   integer :: i,m
+   integer :: i,m,m_occ
    real(wp),allocatable :: Ptmp(:,:)
 
-   allocate(Ptmp(ndim,ndim))
+   m_occ = 0
+   do m = min(ndim, size(focc), size(C, 2)), 1, -1
+      if (abs(focc(m)) > 0.0_wp) then
+         m_occ = m
+         exit
+      end if
+   end do
+   if (m_occ == 0) then
+      P = 0.0_wp
+      return
+   end if
+   if (focc(1) > 0.0_wp) then
+      if (all(focc(1:m_occ) == focc(1))) then
+         call blas_syrk('U', 'N', ndim, m_occ, focc(1), C, ndim, 0.0_wp, P, ndim)
+         do m = 1, ndim
+            do i = 1, m - 1
+               P(m, i) = P(i, m)
+            end do
+         end do
+         return
+      end if
+   end if
+
+   allocate(Ptmp(ndim,m_occ))
    ! acc enter data create(Ptmp(:,:)) copyin(C(:, :), focc(:), P(:, :))
    ! acc kernels default(present)
    Ptmp = 0.0_wp
@@ -1190,14 +1268,14 @@ subroutine dmat(ndim,focc,C,P)
 
    ! acc parallel
    ! acc loop gang collapse(2)
-   do m=1,ndim
+   do m=1,m_occ
       do i=1,ndim
          Ptmp(i,m)=C(i,m)*focc(m)
       enddo
    enddo
    ! acc end parallel
    ! acc update host(Ptmp)
-   call mctc_gemm(C, Ptmp, P, transb='t')
+   call mctc_gemm(C(:, 1:m_occ), Ptmp, P, transb='t')
    ! acc exit data copyout(P(:,:)) delete(C(:,:), focc(:), Ptmp(:, :))
 
    deallocate(Ptmp)
